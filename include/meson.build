@@ -11,6 +11,9 @@ endif
 if not features.get('x11-backend')
 	exclude_files += 'backend/x11.h'
 endif
+if not features.get('qnx-screen-backend')
+	exclude_files += 'backend/qnx_screen.h'
+endif
 if not features.get('xwayland')
 	exclude_files += 'xwayland.h'
 endif

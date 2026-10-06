@@ -215,6 +215,8 @@ static struct wlr_egl *egl_create(void) {
 		return NULL;
 	}
 
+	egl->fallback_drm_fd = -1;
+
 	load_egl_proc(&egl->procs.eglGetPlatformDisplayEXT,
 		"eglGetPlatformDisplayEXT");
 
@@ -224,6 +226,8 @@ static struct wlr_egl *egl_create(void) {
 			"EGL_EXT_platform_device");
 	egl->exts.KHR_display_reference = check_egl_ext(client_exts_str,
 			"EGL_KHR_display_reference");
+	egl->exts.QNX_platform_screen = check_egl_ext(client_exts_str,
+                        "EGL_QNX_platform_screen");
 
 	if (check_egl_ext(client_exts_str, "EGL_EXT_device_base") || check_egl_ext(client_exts_str, "EGL_EXT_device_enumeration")) {
 		load_egl_proc(&egl->procs.eglQueryDevicesEXT, "eglQueryDevicesEXT");
@@ -394,9 +398,16 @@ static bool egl_init(struct wlr_egl *egl, EGLenum platform,
 	display_attribs[display_attribs_len++] = EGL_NONE;
 	assert(display_attribs_len <= sizeof(display_attribs) / sizeof(display_attribs[0]));
 
-	EGLDisplay display = egl->procs.eglGetPlatformDisplayEXT(platform,
-		remote_display, display_attribs);
+	EGLDisplay display;
+	if (platform == EGL_PLATFORM_SCREEN_QNX) {
+		display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+	} else {
+		display = egl->procs.eglGetPlatformDisplayEXT(platform,
+			remote_display, display_attribs);
+	}
 	if (display == EGL_NO_DISPLAY) {
+		EGLint error = eglGetError();
+		printf("EGL Error encountered: 0x%04X\n", error);
 		wlr_log(WLR_ERROR, "Failed to create EGL display");
 		return false;
 	}
@@ -607,6 +618,23 @@ struct wlr_egl *wlr_egl_create_with_drm_fd(int drm_fd) {
 		wlr_log(WLR_DEBUG, "KHR_platform_gbm not supported");
 	}
 
+	// Commented until this client extension string is available in the QNX mesa driver
+	//if (egl->exts.QNX_platform_screen) {
+		if (egl_init(egl, EGL_PLATFORM_SCREEN_QNX, NULL, allow_software)) {
+			wlr_log(WLR_DEBUG, "Using EGL_PLATFORM_SCREEN_QNX");
+			if (drm_fd >= 0) {
+				egl->fallback_drm_fd = fcntl(drm_fd, F_DUPFD_CLOEXEC, 0);
+				if (egl->fallback_drm_fd < 0) {
+					wlr_log_errno(WLR_ERROR,
+							"Failed to dup drm_fd for wlr_egl_dup_drm_fd() fallback");
+				}
+			}
+			return egl;
+		}
+//	} else {
+//		wlr_log(WLR_DEBUG, "QNX_platform_screen not supported");
+//	}
+
 error:
 	wlr_log(WLR_ERROR, "Failed to initialize EGL context");
 	free(egl);
@@ -666,6 +694,10 @@ void wlr_egl_destroy(struct wlr_egl *egl) {
 		int gbm_fd = gbm_device_get_fd(egl->gbm_device);
 		gbm_device_destroy(egl->gbm_device);
 		close(gbm_fd);
+	}
+
+	if (egl->fallback_drm_fd >= 0) {
+		close(egl->fallback_drm_fd);
 	}
 
 	free(egl);
@@ -1044,13 +1076,24 @@ int wlr_egl_dup_drm_fd(struct wlr_egl *egl) {
 	}
 
 	// Fallback to GBM's FD if we can't use EGLDevice
-	if (egl->gbm_device == NULL) {
-		return -1;
-	}
+	if (egl->gbm_device != NULL) {
+		fd = fcntl(gbm_device_get_fd(egl->gbm_device), F_DUPFD_CLOEXEC, 0);
+		if (fd < 0) {
+			wlr_log_errno(WLR_ERROR, "Failed to dup GBM FD");
+		}
+		return fd;
+ 	}
 
-	fd = fcntl(gbm_device_get_fd(egl->gbm_device), F_DUPFD_CLOEXEC, 0);
-	if (fd < 0) {
-		wlr_log_errno(WLR_ERROR, "Failed to dup GBM FD");
+	// Last resort: whatever fd was handed to wlr_egl_create_with_drm_fd(),
+	// for platforms (e.g. EGL_PLATFORM_SCREEN_QNX) whose EGLDisplay doesn't
+	// support EGLDeviceEXT queries and was never bound to a gbm_device in
+	// the first place. See wlr_egl_create_with_drm_fd() above.
+	if (egl->fallback_drm_fd >= 0) {
+		fd = fcntl(egl->fallback_drm_fd, F_DUPFD_CLOEXEC, 0);
+		if (fd < 0) {
+			wlr_log_errno(WLR_ERROR, "Failed to dup fallback DRM fd");
+		}
+		return fd;
 	}
 	return fd;
 }

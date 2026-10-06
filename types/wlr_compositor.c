@@ -19,6 +19,8 @@
 #define COMPOSITOR_VERSION 6
 #define CALLBACK_VERSION 1
 
+
+#ifndef min
 static int min(int fst, int snd) {
 	if (fst < snd) {
 		return fst;
@@ -26,7 +28,9 @@ static int min(int fst, int snd) {
 		return snd;
 	}
 }
+#endif
 
+#ifndef max
 static int max(int fst, int snd) {
 	if (fst > snd) {
 		return fst;
@@ -34,6 +38,7 @@ static int max(int fst, int snd) {
 		return snd;
 	}
 }
+#endif
 
 static void set_pending_buffer_resource(struct wlr_surface *surface,
 		struct wl_resource *resource) {

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="qnx_redir">
+
+  <!-- QNX support. This object is created by the server and published
+       using the display's global event. -->
+  <interface name="wl_qnx_redir" version="1">
+
+    <!-- Notification of the native display_id used by the server.
+         The client should use this display_id to determine which
+         vendor libraries to load. -->
+    <event name="display_id">
+      <arg name="display_id" type="int"/>
+    </event>
+
+  </interface>
+
+</protocol>
+

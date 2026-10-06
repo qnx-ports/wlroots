@@ -4,13 +4,17 @@
 #include <wlr/util/box.h>
 #include <wlr/util/log.h>
 
+#ifndef max
 static int max(int a, int b) {
 	return a > b ? a : b;
 }
+#endif
 
+#ifndef min
 static int min(int a, int b) {
 	return a < b ? a : b;
 }
+#endif
 
 void wlr_box_closest_point(const struct wlr_box *box, double x, double y,
 		double *dest_x, double *dest_y) {

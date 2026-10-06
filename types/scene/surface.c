@@ -231,9 +231,11 @@ static void scene_buffer_unmark_client_buffer(struct wlr_scene_buffer *scene_buf
 	}
 }
 
+#ifndef min
 static int min(int a, int b) {
 	return a < b ? a : b;
 }
+#endif
 
 static void surface_reconfigure(struct wlr_scene_surface *scene_surface) {
 	struct wlr_scene_buffer *scene_buffer = scene_surface->buffer;

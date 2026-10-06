@@ -107,6 +107,7 @@ wlr_files += files(
 	'wlr_xdg_system_bell_v1.c',
 	'wlr_xdg_toplevel_icon_v1.c',
 	'wlr_xdg_toplevel_tag_v1.c',
+        'wlr_qnx_redir.c',
 )
 
 if features.get('drm-backend')

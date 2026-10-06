@@ -8,6 +8,7 @@ struct wlr_egl {
 	EGLContext context;
 	EGLDeviceEXT device; // may be EGL_NO_DEVICE_EXT
 	struct gbm_device *gbm_device;
+	int fallback_drm_fd;
 
 	struct {
 		// Display extensions
@@ -25,6 +26,7 @@ struct wlr_egl {
 		bool EXT_device_query;
 		bool KHR_platform_gbm;
 		bool EXT_platform_device;
+		bool QNX_platform_screen;
 		bool KHR_display_reference;
 	} exts;
 

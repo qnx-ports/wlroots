@@ -24,6 +24,14 @@
 #mesondefine WLR_HAS_X11_BACKEND
 
 /**
+ * Whether the QNX Screen backend is compile-time enabled. Equivalent to the
+ * pkg-config "have_qnx_screen_backend" variable.
+ *
+ * Required for <wlr/backend/qnx_screen.h>.
+ */
+#mesondefine WLR_HAS_QNX_SCREEN_BACKEND
+
+/**
  * Whether the GLES2 renderer is compile-time enabled. Equivalent to the
  * pkg-config "have_gles2_renderer" variable.
  *

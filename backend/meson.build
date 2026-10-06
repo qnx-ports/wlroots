@@ -1,6 +1,9 @@
 wlr_files += files('backend.c')
 
 all_backends = ['drm', 'libinput', 'x11']
+if host_machine.system() == 'qnx'
+	all_backends += ['qnx-screen']
+endif
 backends = get_option('backends')
 if 'auto' in backends and get_option('auto_features').enabled()
 	backends = all_backends

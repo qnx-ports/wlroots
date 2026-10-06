@@ -77,6 +77,9 @@ protocols = {
 	'wlr-output-power-management-unstable-v1': 'wlr-output-power-management-unstable-v1.xml',
 	'wlr-screencopy-unstable-v1': 'wlr-screencopy-unstable-v1.xml',
 	'wlr-virtual-pointer-unstable-v1': 'wlr-virtual-pointer-unstable-v1.xml',
+
+	# QNX Special
+	'wl-qnx-redir': 'qnx-redir.xml'
 }
 
 protocols_code = {}

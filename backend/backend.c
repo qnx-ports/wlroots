@@ -32,6 +32,10 @@
 #include <wlr/backend/x11.h>
 #endif
 
+#if WLR_HAS_QNX_SCREEN_BACKEND
+#include <wlr/backend/qnx_screen.h>
+#endif
+
 #define WAIT_SESSION_TIMEOUT 10000 // ms
 
 void wlr_backend_init(struct wlr_backend *backend,
@@ -287,6 +291,25 @@ static struct wlr_backend *attempt_libinput_backend(struct wlr_session *session)
 #endif
 }
 
+static struct wlr_backend *attempt_qnx_screen_backend(struct wl_event_loop *loop) {
+#if WLR_HAS_QNX_SCREEN_BACKEND
+   struct wlr_backend *backend = wlr_qnx_screen_backend_create(loop);
+   if (backend == NULL) {
+       return NULL;
+   }
+
+   size_t outputs = parse_outputs_env("WLR_QNX_SCREEN_OUTPUTS");
+   for (size_t i = 0; i < outputs; ++i) {
+       wlr_qnx_screen_output_create(backend);
+   }
+
+   return backend;
+#else
+   wlr_log(WLR_ERROR, "Cannot create QNX Screen backend: disabled at compile-time");
+   return NULL;
+#endif
+}
+
 static bool attempt_backend_by_name(struct wl_event_loop *loop,
 		struct wlr_backend *multi, char *name,
 		struct wlr_session **session_ptr) {
@@ -297,6 +320,8 @@ static bool attempt_backend_by_name(struct wl_event_loop *loop,
 		backend = attempt_x11_backend(loop, NULL);
 	} else if (strcmp(name, "headless") == 0) {
 		backend = attempt_headless_backend(loop);
+	} else if (strcmp(name, "qnx-screen") == 0) {
+		backend = attempt_qnx_screen_backend(loop);
 	} else if (strcmp(name, "drm") == 0 || strcmp(name, "libinput") == 0) {
 		// DRM and libinput need a session
 		if (*session_ptr == NULL) {
@@ -390,6 +415,15 @@ struct wlr_backend *wlr_backend_autocreate(struct wl_event_loop *loop,
 			goto error;
 		}
 
+		goto success;
+	}
+
+	struct wlr_backend *qnx_screen_backend = attempt_qnx_screen_backend(loop);
+	if (qnx_screen_backend) {
+		wlr_multi_backend_add(multi, qnx_screen_backend);
+		if (!auto_backend_monitor_create(multi, qnx_screen_backend)) {
+			goto error;
+		}
 		goto success;
 	}
 
