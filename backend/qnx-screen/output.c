@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,7 +11,8 @@
 #include <wlr/interfaces/wlr_output.h>
 #include <wlr/interfaces/wlr_pointer.h>
 #include <wlr/interfaces/wlr_touch.h>
-#include <wlr/render/dmabuf.h>
+#include <wlr/render/gles2.h>
+#include <wlr/render/wlr_texture.h>
 #include <wlr/types/wlr_buffer.h>
 #include <wlr/util/log.h>
 
@@ -39,11 +41,26 @@ static struct wlr_qnx_screen_output *output_from_wlr_output(
  * ---------------------------------
  * A QNX Screen window (screen_window_t) is a native compositor resource:
  * once created, resizing it means re-requesting SCREEN_PROPERTY_SIZE /
- * SCREEN_PROPERTY_BUFFER_SIZE and re-creating its render buffers. There's no
- * standing EGL surface here; the pixman renderer draws into wlr_buffer
- * objects handed to us by the compositor (via the generic SHM allocator),
- * and output_commit() below is responsible for copying finished frames into
- * one of the window's native buffers before calling screen_post_window().
+ * SCREEN_PROPERTY_BUFFER_SIZE and re-creating its render buffers.
+ *
+ * The finished frame is always copied into one of the window's own render
+ * buffers and handed to screen_post_window(). Which copy is used follows the
+ * renderer: glReadPixels for GLES2 (its frame is a DMA-BUF that the CPU cannot
+ * touch directly), a plain memcpy for pixman (its frame is already CPU memory).
+ *
+ * An EGL window surface on the screen_window_t -- which would avoid the copy
+ * entirely -- is worth knowing about but does not work here, so it is not
+ * attempted. Two things have to be true for it, and only one ever is:
+ *
+ *  - eglCreateWindowSurface() needs an EGLConfig with EGL_ALPHA_SIZE 8. With
+ *    0 it fails EGL_BAD_NATIVE_WINDOW whatever the window's usage flags or
+ *    SCREEN_PROPERTY_FORMAT are; matching the window's RGBX8888 by asking for
+ *    no alpha is exactly the wrong thing to do. This is easy to misread as the
+ *    driver being incapable, so it is recorded here.
+ *  - the driver then has to composite what it swaps. On virtio/virgl it does
+ *    not: the surface is created, glReadPixels on its back buffer returns the
+ *    new frame, eglSwapBuffers() returns success (repeatedly), and the panel
+ *    never changes.
  */
 
 bool qnx_screen_output_recreate_buffers(struct wlr_qnx_screen_output *output) {
@@ -78,12 +95,18 @@ bool qnx_screen_output_recreate_buffers(struct wlr_qnx_screen_output *output) {
 		return false;
 	}
 	output->n_buffers = QNX_SCREEN_NUM_BUFFERS;
+	// Fresh buffers hold undefined pixels, so there is nothing to fill
+	// undamaged areas from until the first full frame has been posted.
+	output->baseline_valid = false;
 	output->buffer_index = 0;
 
 	return true;
 }
 
-bool qnx_screen_output_create_window(struct wlr_qnx_screen_output *output) {
+// Create a window sized/positioned as the output wants, with the given Screen
+// buffer usage flags. Returns false if the window could not be created.
+static bool output_configure_window(struct wlr_qnx_screen_output *output,
+		int usage) {
 	struct wlr_qnx_screen_backend *b = output->backend;
 
 	if (screen_create_window(&output->window, b->context) != 0) {
@@ -98,12 +121,6 @@ bool qnx_screen_output_create_window(struct wlr_qnx_screen_output *output) {
 			SCREEN_PROPERTY_DISPLAY, (void **)&display);
 	}
 
-	int usage[] = { SCREEN_USAGE_NATIVE | SCREEN_USAGE_READ | SCREEN_USAGE_WRITE };
-	screen_set_window_property_iv(output->window, SCREEN_PROPERTY_USAGE, usage);
-
-	int format[] = { SCREEN_FORMAT_RGBX8888 };
-	screen_set_window_property_iv(output->window, SCREEN_PROPERTY_FORMAT, format);
-
 	if (output->fullscreen && display != NULL) {
 		int display_size[] = { output->win_width, output->win_height };
 		screen_get_display_property_iv(display, SCREEN_PROPERTY_SIZE,
@@ -115,9 +132,45 @@ bool qnx_screen_output_create_window(struct wlr_qnx_screen_output *output) {
 		output->y = 0;
 	}
 
+	// Usage must be set before the window has any buffers. On the
+	// virtio/virgl driver changing it afterwards leaves
+	// screen_create_window_buffers() failing with ENOTSUP for the rest of the
+	// window's life, so this is the only place it is ever set.
+	int u[] = { usage };
+	if (screen_set_window_property_iv(output->window, SCREEN_PROPERTY_USAGE,
+			u) != 0) {
+		wlr_log(WLR_ERROR, "screen_set_window_property_iv(USAGE) failed");
+		return false;
+	}
+
+	int format[] = { SCREEN_FORMAT_RGBX8888 };
+	screen_set_window_property_iv(output->window, SCREEN_PROPERTY_FORMAT, format);
+
 	int position[] = { output->x, output->y };
 	screen_set_window_property_iv(output->window, SCREEN_PROPERTY_POSITION,
 		position);
+
+	int size[] = { output->win_width, output->win_height };
+	// Deliberately does NOT set SCREEN_PROPERTY_BUFFER_COUNT: on the
+	// virtio/virgl driver that leaves the window unable to create any buffers
+	// at all (ENOTTY), and Mesa's Screen platform sets it itself.
+	screen_set_window_property_iv(output->window, SCREEN_PROPERTY_SIZE, size);
+	screen_set_window_property_iv(output->window, SCREEN_PROPERTY_BUFFER_SIZE,
+		size);
+	return true;
+}
+
+bool qnx_screen_output_create_window(struct wlr_qnx_screen_output *output) {
+	struct wlr_qnx_screen_backend *b = output->backend;
+
+	if (!output_configure_window(output, SCREEN_USAGE_NATIVE
+			| SCREEN_USAGE_READ | SCREEN_USAGE_WRITE)) {
+		if (output->window != NULL) {
+			screen_destroy_window(output->window);
+			output->window = NULL;
+		}
+		return false;
+	}
 
 	if (!qnx_screen_output_recreate_buffers(output)) {
 		screen_destroy_window(output->window);
@@ -196,28 +249,22 @@ static bool output_test(struct wlr_output *wlr_output,
 			return false;
 		}
 
-		struct wlr_shm_attributes shm;
-		struct wlr_dmabuf_attributes dmabuf;
-		if (wlr_buffer_get_shm(state->buffer, &shm)) {
-			// OK: CPU-copied straight into the QNX Screen window buffer.
-		} else if (wlr_buffer_get_dmabuf(state->buffer, &dmabuf)) {
-			// OK, as long as it's something we can mmap() and walk row by
-			// row: single-plane, linear (matches the LINEAR-only modifier
-			// we advertise in output_get_primary_formats(), so a
-			// conforming allocator shouldn't hand us anything else, but
-			// don't trust that blindly).
-			if (dmabuf.n_planes != 1 || dmabuf.modifier != DRM_FORMAT_MOD_LINEAR) {
-				wlr_log(WLR_DEBUG,
-					"Unsupported dmabuf layout (n_planes=%d modifier=0x%"PRIx64")",
-					dmabuf.n_planes, (uint64_t)dmabuf.modifier);
+		// What counts as a usable buffer depends on how the frame is read
+		// out of it, which depends on the renderer.
+		if (!wlr_renderer_is_gles2(wlr_output->renderer)) {
+			// The frame is memcpy'd straight out of the buffer's own memory,
+			// so it has to be CPU-backed.
+			struct wlr_shm_attributes shm;
+			if (!wlr_buffer_get_shm(state->buffer, &shm)) {
+				wlr_log(WLR_DEBUG, "QNX Screen output needs a shared-memory "
+					"buffer when the renderer is not GLES2");
 				return false;
 			}
-		} else {
-			wlr_log(WLR_DEBUG,
-				"QNX Screen output only supports shared-memory or "
-				"single-plane linear dmabuf buffers");
-			return false;
 		}
+		// With GLES2 any buffer the renderer can turn into a texture works;
+		// wlr_texture_from_buffer() fails for the rest, and a tiling or
+		// multi-plane layout is no longer a problem because the GL driver
+		// does the read-back instead of a CPU walking the bytes.
 	}
 
 	if (state->committed & WLR_OUTPUT_STATE_MODE && state->mode_type == WLR_OUTPUT_STATE_MODE_CUSTOM) {
@@ -235,130 +282,207 @@ static bool output_test(struct wlr_output *wlr_output,
 
 static int finish_frame_handler(void *data) {
 	struct wlr_qnx_screen_output *output = data;
+	/* Record when the frame event goes out: the compositor's render and the
+	 * resulting commit both happen after this, so it is the start of the frame
+	 * period the pacer in output_commit() measures against. */
+	clock_gettime(CLOCK_MONOTONIC, &output->frame_event_at);
 	wlr_output_send_frame(&output->wlr_output);
 	return 0;
 }
 
-struct qnx_screen_buffer_access {
-	bool is_shm;
-	struct gbm_bo *gbm_bo;
-	void *gbm_map_data;
-};
+// GLES2 present path.
+//
+// The frame was rendered by the GPU into a DMA-BUF, and a Screen window buffer
+// is plain CPU memory, so the pixels have to cross from one to the other. This
+// asks the GL driver for them (wlr_texture_read_pixels(), the same path
+// wlroots' own screenshots use), which costs ~16ms per 1080p frame on
+// virtio/virgl.
+//
+// The alternative, gbm_bo_map(), was measured at ~36ms for the identical frame:
+// the buffer allocator's read-back transfer is roughly 2.2x the driver's own,
+// which is what capped this backend near 19fps versus the ~31fps here.
+//
+// The read-back is limited to the committed damage, because it is by far the
+// most expensive step and it scales with area (~1.2 GB/s measured). Only the
+// damaged boxes are read out of GL; the rest of the window buffer is filled on
+// the CPU from the buffer that was posted last frame, which holds exactly the
+// frame being updated. A full-frame CPU memcpy is ~1.5ms against ~16ms for the
+// same pixels through the driver, so filling everything and then overwriting
+// the damage is cheaper than computing the undamaged complement, and much
+// harder to get wrong.
+static bool copy_buffer_to_window_gles(struct wlr_qnx_screen_output *output,
+		struct wlr_buffer *buffer, const pixman_region32_t *damage) {
+	struct wlr_renderer *wlr_renderer = output->wlr_output.renderer;
 
-// Gets a CPU-readable pointer + row stride to a wlr_buffer's pixel data,
-// regardless of whether it's SHM-backed (the common case today) or
-// dmabuf-backed (once wlr_allocator_autocreate() picks GBM, see backend.c).
-// QNX Screen buffers are always window-bound, so there's no way to make the
-// renderer draw directly into one -- we always end up doing this copy.
-static bool begin_buffer_access(struct wlr_qnx_screen_backend *backend,
-		struct wlr_buffer *buffer, void **src_out, size_t *stride_out,
-		struct qnx_screen_buffer_access *access) {
-	memset(access, 0, sizeof(*access));
-
-	void *src;
-	uint32_t format;
-	size_t stride;
-	if (wlr_buffer_begin_data_ptr_access(buffer,
-			WLR_BUFFER_DATA_PTR_ACCESS_READ, &src, &format, &stride)) {
-		access->is_shm = true;
-		*src_out = src;
-		*stride_out = stride;
-		return true;
+	size_t row = (size_t)buffer->width * 4;
+	size_t need = row * buffer->height;
+	// Grow-only: resizing the output to something larger reallocates, but
+	// shrinking keeps the (oversized) allocation, which output_destroy() frees.
+	if (need > output->readback_cap) {
+		free(output->readback_px);
+		output->readback_px = malloc(need);
+		output->readback_cap =
+			output->readback_px ? need : 0;
+		if (output->readback_px == NULL) {
+			return false;
+		}
 	}
 
-	struct wlr_dmabuf_attributes dmabuf;
-	if (!wlr_buffer_get_dmabuf(buffer, &dmabuf) || dmabuf.n_planes != 1) {
+	struct wlr_texture *tex = wlr_texture_from_buffer(wlr_renderer, buffer);
+	if (tex == NULL) {
+		wlr_log(WLR_ERROR, "qnx-screen: cannot import output buffer as a "
+			"texture");
 		return false;
 	}
-
-	struct gbm_device *gbm_device = qnx_screen_backend_ensure_gbm_device(backend);
-	if (gbm_device == NULL) {
-		wlr_log(WLR_ERROR,
-			"Got a dmabuf-backed output buffer but have no usable gbm_device "
-			"to read it back with");
-		return false;
-	}
-
-	// A bare mmap() on dmabuf.fd[0] is deliberately NOT used here. On some
-	// drivers (virtio-gpu/virgl in particular -- the buffer may live
-	// host-side in a VM) a raw mmap() bypasses whatever transfer the driver
-	// needs to actually get rendered content into a CPU-visible mapping,
-	// and reads back as stale/zeroed (black) regardless of dma-buf fencing.
-	// gbm_bo_map() is the portable, driver-correct way to read a GBM
-	// buffer's contents back to the CPU -- it's what handles that transfer
-	// (or does nothing extra, on drivers where a plain mmap would've been
-	// fine) internally, the same way wlroots' own renderer never does a raw
-	// mmap() either (it goes through glReadPixels/wlr_texture_read_pixels).
-	struct gbm_import_fd_modifier_data import_data = {
-		.width = (uint32_t)buffer->width,
-		.height = (uint32_t)buffer->height,
-		.format = dmabuf.format,
-		.num_fds = 1,
-		.modifier = dmabuf.modifier,
-	};
-	import_data.fds[0] = dmabuf.fd[0];
-	import_data.strides[0] = dmabuf.stride[0];
-	import_data.offsets[0] = dmabuf.offset[0];
-
-	struct gbm_bo *bo = gbm_bo_import(gbm_device,
-		GBM_BO_IMPORT_FD_MODIFIER, &import_data, GBM_BO_USE_RENDERING);
-	if (bo == NULL) {
-		wlr_log(WLR_ERROR, "gbm_bo_import failed");
-		return false;
-	}
-
-	uint32_t map_stride = 0;
-	void *map_data = NULL;
-	void *ptr = gbm_bo_map(bo, 0, 0, (uint32_t)buffer->width,
-		(uint32_t)buffer->height, GBM_BO_TRANSFER_READ, &map_stride,
-		&map_data);
-	if (ptr == NULL) {
-		wlr_log(WLR_ERROR, "gbm_bo_map failed");
-		gbm_bo_destroy(bo);
-		return false;
-	}
-
-	access->gbm_bo = bo;
-	access->gbm_map_data = map_data;
-
-	*src_out = ptr;
-	*stride_out = map_stride;
-	return true;
-}
-
-static void end_buffer_access(struct wlr_buffer *buffer,
-		struct qnx_screen_buffer_access *access) {
-	if (access->is_shm) {
-		wlr_buffer_end_data_ptr_access(buffer);
-		return;
-	}
-	if (access->gbm_bo != NULL) {
-		gbm_bo_unmap(access->gbm_bo, access->gbm_map_data);
-		gbm_bo_destroy(access->gbm_bo);
-	}
-}
-
-static bool copy_buffer_to_window(struct wlr_qnx_screen_output *output,
-		struct wlr_buffer *buffer, const struct wlr_output_state *state) {
-	void *src;
-	size_t src_stride;
-	struct qnx_screen_buffer_access access;
-	if (!begin_buffer_access(output->backend, buffer, &src, &src_stride,
-			&access)) {
-		wlr_log(WLR_ERROR, "Failed to access buffer contents for copy");
-		return false;
-	}
-
 	screen_buffer_t native = output->buffers[output->buffer_index];
-
 	void *dst = NULL;
 	int dst_stride = 0;
 	screen_get_buffer_property_pv(native, SCREEN_PROPERTY_POINTER, &dst);
 	screen_get_buffer_property_iv(native, SCREEN_PROPERTY_STRIDE, &dst_stride);
-
 	if (dst == NULL || dst_stride <= 0) {
-		wlr_log(WLR_ERROR, "Failed to access QNX Screen native buffer");
-		end_buffer_access(buffer, &access);
+		wlr_log(WLR_ERROR, "qnx-screen: no access to the window buffer");
+		wlr_texture_destroy(tex);
+		return false;
+	}
+
+	// Fill the areas the damage does not cover from the buffer that is
+	// currently on screen. That buffer holds the frame we are updating, so
+	// this leaves the target holding a complete, correct frame before the
+	// damaged boxes are painted over it -- which matters because Screen keeps
+	// the whole window buffer and may recomposite all of it later, not just the
+	// rectangles handed to screen_post_window().
+	//
+	// It is safe to read: the buffer we are writing is by construction not the
+	// one being displayed (that is what the rotation in output_post_window()
+	// is for), and the one being read is only ever written by us.
+	int prev = (output->buffer_index + output->n_buffers - 1)
+		% output->n_buffers;
+	void *src_prev = NULL;
+	int src_prev_stride = 0;
+	if (output->baseline_valid && output->n_buffers > 1) {
+		screen_get_buffer_property_pv(output->buffers[prev],
+			SCREEN_PROPERTY_POINTER, &src_prev);
+		screen_get_buffer_property_iv(output->buffers[prev],
+			SCREEN_PROPERTY_STRIDE, &src_prev_stride);
+	}
+
+	bool partial = false;
+	int box_count = 0;
+	pixman_box32_t *boxes = NULL;
+	if (src_prev != NULL && src_prev_stride > 0 && damage != NULL) {
+		boxes = pixman_region32_rectangles((pixman_region32_t *)damage,
+			&box_count);
+		partial = box_count > 0;
+	}
+
+	if (partial) {
+		size_t fill = row < (size_t)dst_stride ? row : (size_t)dst_stride;
+		if (fill > (size_t)src_prev_stride) {
+			fill = (size_t)src_prev_stride;
+		}
+		for (int y = 0; y < buffer->height; y++) {
+			memcpy((uint8_t *)dst + (size_t)y * dst_stride,
+				(const uint8_t *)src_prev + (size_t)y * src_prev_stride,
+				fill);
+		}
+	}
+
+	// No vertical flip: measured on target with a RED-top/BLUE-BOTTOM client,
+	// wlr_texture_read_pixels() already yields the buffer top-down, and adding
+	// the flip that glReadPixels' bottom-up origin suggests puts the panel
+	// upside down. That was measured full-frame; see the note below on why a
+	// sub-box is safe.
+	size_t copy_bytes = row < (size_t)dst_stride ? row : (size_t)dst_stride;
+
+	if (!partial) {
+		struct wlr_texture_read_pixels_options opts = {
+			.data = output->readback_px,
+			.format = DRM_FORMAT_XRGB8888,
+			.stride = (uint32_t)row,
+			.src_box = { .width = buffer->width, .height = buffer->height },
+		};
+		bool ok = wlr_texture_read_pixels(tex, &opts);
+		if (!ok) {
+			wlr_log(WLR_ERROR, "qnx-screen: glReadPixels read-back failed");
+		}
+		for (int y = 0; ok && y < buffer->height; y++) {
+			memcpy((uint8_t *)dst + (size_t)y * dst_stride,
+				(const uint8_t *)output->readback_px + (size_t)y * row,
+				copy_bytes);
+		}
+		wlr_texture_destroy(tex);
+		if (ok) {
+			output->baseline_valid = true;
+		}
+		return ok;
+	}
+
+	// One box at a time. With stride == width*4 and dst_x == 0 the GLES2
+	// backend takes its single-glReadPixels path rather than reading row by
+	// row (see gles2_texture_read_pixels()).
+	for (int i = 0; i < box_count; i++) {
+		int x1 = boxes[i].x1, y1 = boxes[i].y1;
+		int x2 = boxes[i].x2, y2 = boxes[i].y2;
+		if (x1 < 0) x1 = 0;
+		if (y1 < 0) y1 = 0;
+		if (x2 > buffer->width) x2 = buffer->width;
+		if (y2 > buffer->height) y2 = buffer->height;
+		if (x2 <= x1 || y2 <= y1) {
+			continue;
+		}
+		int bw = x2 - x1, bh = y2 - y1;
+		size_t brow = (size_t)bw * 4;
+
+		struct wlr_texture_read_pixels_options opts = {
+			.data = output->readback_px,
+			.format = DRM_FORMAT_XRGB8888,
+			.stride = (uint32_t)brow,
+			.src_box = { .x = x1, .y = y1, .width = bw, .height = bh },
+		};
+		if (!wlr_texture_read_pixels(tex, &opts)) {
+			wlr_log(WLR_ERROR, "qnx-screen: glReadPixels read-back failed "
+				"for damage box %d,%d %dx%d", x1, y1, bw, bh);
+			wlr_texture_destroy(tex);
+			return false;
+		}
+		size_t bcopy = brow < (size_t)dst_stride ? brow : (size_t)dst_stride;
+		for (int y = 0; y < bh; y++) {
+			memcpy((uint8_t *)dst + (size_t)(y1 + y) * dst_stride + (size_t)x1 * 4,
+				(const uint8_t *)output->readback_px + (size_t)y * brow,
+				bcopy);
+		}
+	}
+
+	output->baseline_valid = true;
+	wlr_texture_destroy(tex);
+	return true;
+}
+
+// Pixman present path.
+//
+// The frame was rendered on the CPU, so the buffer already is CPU memory the
+// memcpy below can read directly -- there is no transfer to avoid and nothing
+// to read back.
+static bool copy_buffer_to_window_cpu(struct wlr_qnx_screen_output *output,
+		struct wlr_buffer *buffer) {
+	void *src;
+	uint32_t format;
+	size_t src_stride;
+	if (!wlr_buffer_begin_data_ptr_access(buffer,
+			WLR_BUFFER_DATA_PTR_ACCESS_READ, &src, &format, &src_stride)) {
+		wlr_log(WLR_ERROR, "qnx-screen: pixman output buffer is not "
+			"CPU-readable; the generic allocator must be used with pixman");
+		return false;
+	}
+
+	screen_buffer_t native = output->buffers[output->buffer_index];
+	void *dst = NULL;
+	int dst_stride = 0;
+	screen_get_buffer_property_pv(native, SCREEN_PROPERTY_POINTER, &dst);
+	screen_get_buffer_property_iv(native, SCREEN_PROPERTY_STRIDE, &dst_stride);
+	if (dst == NULL || dst_stride <= 0) {
+		wlr_log(WLR_ERROR, "qnx-screen: no access to the window buffer");
+		wlr_buffer_end_data_ptr_access(buffer);
 		return false;
 	}
 
@@ -370,16 +494,30 @@ static bool copy_buffer_to_window(struct wlr_qnx_screen_output *output,
 
 	for (int y = 0; y < buffer->height; y++) {
 		memcpy((uint8_t *)dst + (size_t)y * dst_stride,
-			(uint8_t *)src + (size_t)y * src_stride, copy_bytes);
+			(const uint8_t *)src + (size_t)y * src_stride, copy_bytes);
 	}
 
-	end_buffer_access(buffer, &access);
+	wlr_buffer_end_data_ptr_access(buffer);
+	return true;
+}
 
-	// Compute dirty rectangles from the damage region, in the same
-	// [x1, y1, x2, y2] layout screen_post_window() expects.
+/*
+ * Hand the window buffer that was just filled (by whichever path) to Screen,
+ * then rotate to the next one. screen_post_window() takes dirty rectangles in
+ * the same top-down window coordinate system that both present paths fill the
+ * buffers in.
+ */
+static bool output_post_window(struct wlr_qnx_screen_output *output,
+		const struct wlr_output_state *state) {
+	if (output->n_buffers == 0) {
+		return false;
+	}
+
+	screen_buffer_t native = output->buffers[output->buffer_index];
+
 	int nrects = 0;
 	int *rects = NULL;
-	int full_rect[4] = { 0, 0, buffer->width, buffer->height };
+	int full_rect[4] = { 0, 0, output->win_width, output->win_height };
 
 	if (state->committed & WLR_OUTPUT_STATE_DAMAGE) {
 		int box_count = 0;
@@ -406,13 +544,14 @@ static bool copy_buffer_to_window(struct wlr_qnx_screen_output *output,
 	}
 
 	int ret = screen_post_window(output->window, native, nrects, rects, 0);
+	int err = errno;
 
 	if (rects != full_rect) {
 		free(rects);
 	}
 
 	if (ret != 0) {
-		wlr_log(WLR_ERROR, "screen_post_window failed");
+		wlr_log(WLR_ERROR, "screen_post_window failed: %s", strerror(err));
 		return false;
 	}
 
@@ -437,7 +576,10 @@ static bool output_commit(struct wlr_output *wlr_output,
 			output->win_width = width;
 			output->win_height = height;
 			if (output->window != NULL) {
-				if (!qnx_screen_output_recreate_buffers(output)) {
+				// Screen window buffers cannot be resized in place, so
+				// rebuild the window at the new size.
+				qnx_screen_output_destroy_window(output);
+				if (!qnx_screen_output_create_window(output)) {
 					return false;
 				}
 			}
@@ -456,8 +598,24 @@ static bool output_commit(struct wlr_output *wlr_output,
 		}
 	}
 
+	/*
+	 * When the fake vsync starts, so the delay below can be charged against
+	 * the frame instead of added on top of it. See the pacer note at the
+	 * bottom of this function.
+	 */
 	if ((state->committed & WLR_OUTPUT_STATE_BUFFER) && output->window != NULL) {
-		if (!copy_buffer_to_window(output, state->buffer, state)) {
+		// Which copy depends only on the renderer: GLES2 rendered the frame on
+		// the GPU into a DMA-BUF and has to be read back, pixman rendered it on
+		// the CPU and can be memcpy'd straight out of the buffer.
+		bool ok;
+		if (wlr_renderer_is_gles2(wlr_output->renderer)) {
+			ok = copy_buffer_to_window_gles(output, state->buffer,
+				(state->committed & WLR_OUTPUT_STATE_DAMAGE)
+					? &state->damage : NULL);
+		} else {
+			ok = copy_buffer_to_window_cpu(output, state->buffer);
+		}
+		if (!ok || !output_post_window(output, state)) {
 			return false;
 		}
 	}
@@ -469,8 +627,68 @@ static bool output_commit(struct wlr_output *wlr_output,
 		};
 		output_defer_present(wlr_output, present_event);
 
-		int32_t delay = output->frame_delay_ms > 0 ? output->frame_delay_ms : 16;
-		wl_event_source_timer_update(output->frame_timer, delay);
+		/*
+		 * Fake vsync. wlroots expects an output to emit a frame event once per
+		 * display refresh, and that event is what releases the next frame
+		 * through the compositor; an output that stops emitting it stalls.
+		 * Nothing here can drive it directly: screen_wait_vsync() does work on
+		 * this driver (measured 12-17ms per call, ~60Hz) but it BLOCKS, and
+		 * this runs on the compositor's single-threaded event loop.
+		 *
+		 * A real present completion is available -- screen_notify() with
+		 * SCREEN_NOTIFY_UPDATE fires when Screen finishes composition, and
+		 * backend/qnx-screen/event_monitor.c already has the thread-plus-pipe
+		 * plumbing that turns a Screen pulse into a non-blocking wayland fd
+		 * event source (it is used for input today). Wiring that up to send
+		 * frame events would replace this timer and make pacing follow the
+		 * display rather than a wall clock estimate; it is left as a timer for
+		 * now because it needs verifying against real hardware, where the
+		 * notification may arrive on a different cadence than measured here.
+		 *
+		 * TODO: drive frame events from SCREEN_NOTIFY_UPDATE.
+		 *
+
+		 * It has to be a period TARGET, not a fixed post-commit delay: the
+		 * frame callback is what unblocks the next frame, so any delay here
+		 * is added to the frame time rather than overlapping with it. With a
+		 * flat 16ms the measured frame period was commit + 16ms exactly --
+		 * 33ms (29fps) once the GLES2 read-back had eaten 17ms, and only
+		 * 17ms (55fps) on the pixman path, where commit is under 1ms. Both
+		 * far from the 60Hz the panel actually runs at.
+		 *
+		 * Charging the commit time against the period makes the backend hold
+		 * the frame rate instead of degrading with it: a 17ms commit still
+		 * leaves ~0ms to wait, and an idle commit still paces at 60Hz.
+		 *
+		 * Clamped to at least 1ms on purpose: wl_event_source_timer_update()
+		 * treats 0 as "disable the timer", which would stall the output loop
+		 * entirely once commit got fast enough.
+		 */
+		int32_t period = output->frame_delay_ms > 0 ? output->frame_delay_ms : 16;
+		struct timespec now;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		/*
+		 * Only a commit that carried a buffer consumed the frame. Anything
+		 * else (a modeset, an enable) has no render behind it, so charging it
+		 * would shorten the wait for no reason and, if such commits ever
+		 * arrived back to back, push the output loop to its 1ms floor.
+		 */
+		int64_t spent = 0;
+		if (state->committed & WLR_OUTPUT_STATE_BUFFER
+				&& output->frame_event_at.tv_sec > 0) {
+			spent = (int64_t)(now.tv_sec - output->frame_event_at.tv_sec) * 1000
+				+ (now.tv_nsec - output->frame_event_at.tv_nsec) / 1000000;
+			if (spent < 0) {
+				spent = 0;
+			}
+		}
+		int64_t delay = (int64_t)period - spent;
+		if (delay < 1) {
+			delay = 1;
+		} else if (delay > period) {
+			delay = period;
+		}
+		wl_event_source_timer_update(output->frame_timer, (int32_t)delay);
 	}
 
 	return true;
@@ -494,15 +712,11 @@ static const struct wlr_drm_format_set *output_get_primary_formats(
 	struct wlr_qnx_screen_output *output = output_from_wlr_output(wlr_output);
 	struct wlr_qnx_screen_backend *backend = output->backend;
 
-	// Advertise dmabuf/GBM formats based on drm_fd availability, not on
-	// whether backend->gbm_device has been created yet -- it's created
-	// lazily on first actual buffer readback (see
-	// qnx_screen_backend_ensure_gbm_device() in backend.c), which hasn't
-	// happened yet the first time this gets called: wlr_allocator_autocreate()
-	// queries formats BEFORE any buffer exists, to decide whether to try
-	// GBM at all. If our lazy gbm_device creation later fails anyway,
-	// copy_buffer_to_window() fails that specific commit loudly rather
-	// than silently -- better than never trying GBM in the first place.
+	// buffer_caps comes from the allocator the compositor picked, which
+	// already reflects the renderer: the gles2 renderer only accepts DMA-BUF
+	// render targets, so with it wlr_allocator_autocreate() gives us a GBM
+	// allocator and DMABUF shows up here; pixman accepts CPU pointers, so its
+	// SHM allocator reaches the SHM branch and the plain memcpy path.
 	if ((buffer_caps & WLR_BUFFER_CAP_DMABUF) && backend->drm_fd >= 0) {
 		return &backend->dmabuf_formats;
 	}
@@ -527,6 +741,10 @@ static void output_destroy(struct wlr_output *wlr_output) {
 	}
 
 	qnx_screen_output_destroy_window(output);
+
+	free(output->readback_px);
+	output->readback_px = NULL;
+	output->readback_cap = 0;
 
 	wl_list_remove(&output->link);
 

@@ -6,8 +6,6 @@
 
 #include <screen/screen.h>
 
-#include <gbm.h>
-
 #include <wayland-server-core.h>
 
 #include <wlr/backend/qnx_screen.h>
@@ -18,6 +16,8 @@
 #include <wlr/render/drm_format_set.h>
 
 #include "backend/qnx_screen_event_monitor.h"
+
+struct wlr_renderer;
 
 #define QNX_SCREEN_WINDOW_MIN_SIZE 128
 #define QNX_SCREEN_WINDOW_MAX_SIZE 8192
@@ -32,10 +32,10 @@ struct wlr_qnx_screen_backend {
 	screen_context_t context;
 	screen_display_t default_display;
 
-	int drm_fd; // -1 if unavailable; see open_drm_render_node() in backend.c
-	int gbm_fd; // dup() of drm_fd, owned by gbm_device below
-	struct gbm_device *gbm_device; // NULL until first successful use, or forever if unavailable
-	bool gbm_device_init_attempted; // set on first qnx_screen_backend_ensure_gbm_device() call, success or not
+	// -1 if unavailable; see open_drm_render_node() in backend.c. Reported to
+	// the compositor so wlr_allocator_autocreate() can pick a GBM allocator for
+	// client buffers; this backend never creates a gbm_device of its own.
+	int drm_fd;
 
 	struct wl_event_source *screen_source;
 	struct wlr_qnx_screen_event_monitor *event_monitor;
@@ -48,10 +48,10 @@ struct wlr_qnx_screen_backend {
 	int prev_screen_modifiers;
 
 	struct wlr_drm_format_set shm_formats;
-	// Only meaningful (and only ever populated) when drm_fd >= 0: XRGB8888
-	// with an explicit LINEAR modifier, so dmabuf-backed output buffers stay
-	// CPU-mmap-able for the copy into the QNX Screen window's own buffer --
-	// see copy_buffer_to_window() in output.c.
+	// The swapchain formats offered to the compositor, keyed off
+	// output_get_primary_formats(): SHM for the pixman renderer, and GBM
+	// DMA-BUF for the GLES2 one (which can only render into a DMA-BUF).
+	// Populated when a DRM render node is available; see open_drm_render_node().
 	struct wlr_drm_format_set dmabuf_formats;
 
 	struct wl_listener event_loop_destroy;
@@ -78,6 +78,35 @@ struct wlr_qnx_screen_output {
 	int32_t frame_delay_ms;
 	struct wl_event_source *frame_timer;
 
+	/*
+	 * Both present paths copy the finished frame into one of this window's
+	 * own render buffers and hand it to screen_post_window(). Which copy is
+	 * used follows the renderer: copy_buffer_to_window_gles() reads a GLES2
+	 * frame back with glReadPixels, copy_buffer_to_window_cpu() memcpy's a
+	 * pixman frame straight out of its buffer.
+	 */
+
+	/*
+	 * Staging for the GLES2 read-back, sized on first use and freed in
+	 * output_destroy(). Large: one 1080p frame is ~8MB.
+	 */
+	void *readback_px;
+	size_t readback_cap;
+
+	/*
+	 * Set once a full frame has been written into every window buffer, so the
+	 * buffer holding the previous frame is safe to copy undamaged areas from.
+	 * Cleared whenever the window buffers are (re)created.
+	 */
+	bool baseline_valid;
+
+	/*
+	 * When the last frame event was emitted (zeroed if never). The fake vsync
+	 * pacer measures the frame period from here, so it can charge the
+	 * compositor's render time against the period as well as our own commit.
+	 */
+	struct timespec frame_event_at;
+
 	struct wlr_pointer pointer;
 	uint32_t prev_buttons;
 
@@ -99,13 +128,6 @@ struct wlr_qnx_screen_output *qnx_screen_output_from_window(
 extern const struct wlr_keyboard_impl qnx_screen_keyboard_impl;
 extern const struct wlr_pointer_impl qnx_screen_pointer_impl;
 extern const struct wlr_touch_impl qnx_screen_touch_impl;
-
-// Lazily creates (on first call) and returns backend->gbm_device, or NULL if
-// unavailable/failed. Deliberately NOT created eagerly at backend creation
-// time -- see the comment on backend_get_drm_fd() in backend.c for why.
-// Safe to call repeatedly; only actually attempts creation once.
-struct gbm_device *qnx_screen_backend_ensure_gbm_device(
-	struct wlr_qnx_screen_backend *backend);
 
 bool qnx_screen_output_create_window(struct wlr_qnx_screen_output *output);
 void qnx_screen_output_destroy_window(struct wlr_qnx_screen_output *output);

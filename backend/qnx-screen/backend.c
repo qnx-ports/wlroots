@@ -19,20 +19,19 @@
 #include "backend/qnx_screen.h"
 
 /*
- * QNX Screen windows have no native concept of dmabuf/GBM -- but if this
- * system has a working DRM render node behind /dev/dri (a real one, not a
- * QNX Screen abstraction), wlroots' own wlr_renderer_autocreate()/
+ * QNX Screen windows have no native concept of dmabuf, but if this system has
+ * a working DRM render node behind /dev/dri (a real one, not a QNX Screen
+ * abstraction), wlroots' own wlr_renderer_autocreate()/
  * wlr_allocator_autocreate() will use it to select the GLES2 renderer and a
  * GBM allocator entirely on their own, the moment wlr_backend_get_drm_fd()
  * returns something >= 0. That in turn is what makes labwc advertise
  * zwp_linux_dmabuf_v1 to clients (see wlr_linux_dmabuf_v1_create_with_renderer()
  * in wlroots' types/wlr_linux_dmabuf_v1.c) -- we don't implement that
- * protocol ourselves, we just need to stop returning -1 here.
+ * protocol ourselves, we just need to return the fd.
  *
- * Our own output_commit() still has to get pixels onto an actual QNX Screen
- * window buffer, which stays CPU-side (see copy_buffer_to_window() in
- * output.c) -- but everything upstream of that (client rendering, the
- * renderer's internal scene compositing) is now real GLES2/dmabuf.
+ * Everything upstream of the present (client rendering, the renderer's scene
+ * compositing, client dmabuf import) is then real GLES2/dmabuf; getting the
+ * finished frame onto the panel is output.c's job.
  *
  * Override with $WLR_QNX_SCREEN_DRM_DEVICE if the render node isn't at one
  * of the usual /dev/dri/renderD1xx paths.
@@ -231,12 +230,6 @@ static void backend_destroy(struct wlr_backend *wlr_backend) {
 	wlr_drm_format_set_finish(&backend->shm_formats);
 	wlr_drm_format_set_finish(&backend->dmabuf_formats);
 
-	if (backend->gbm_device != NULL) {
-		gbm_device_destroy(backend->gbm_device);
-	}
-	if (backend->gbm_fd >= 0) {
-		close(backend->gbm_fd);
-	}
 	if (backend->drm_fd >= 0) {
 		close(backend->drm_fd);
 	}
@@ -248,59 +241,6 @@ static void backend_destroy(struct wlr_backend *wlr_backend) {
 	free(backend);
 }
 
-struct gbm_device *qnx_screen_backend_ensure_gbm_device(
-		struct wlr_qnx_screen_backend *backend) {
-	if (backend->gbm_device_init_attempted) {
-		return backend->gbm_device; // NULL if the first attempt failed
-	}
-	backend->gbm_device_init_attempted = true;
-
-	if (backend->drm_fd < 0) {
-		return NULL;
-	}
-
-	// output.c's copy_buffer_to_window() uses this (via
-	// gbm_bo_import()/gbm_bo_map()) to read GPU-rendered dmabuf output
-	// buffers back to the CPU. This matters more than it might look: a
-	// bare mmap() on the dmabuf fd is NOT sufficient on every driver --
-	// e.g. virtio-gpu (virgl) resources live host-side and need the
-	// driver's own transfer path, which only gbm_bo_map() is guaranteed
-	// to trigger. Without a working gbm_device here, dmabuf output reads
-	// back as black/garbage regardless of dma-buf fencing.
-	//
-	// Deliberately dup()'d: wlr_allocator_autocreate() creates its OWN
-	// independent gbm_device against backend->drm_fd. Two struct
-	// gbm_device instances sharing one fd is a real conflict on some
-	// drivers -- observed in practice as wlroots' own "Failed to create
-	// allocator" once this backend also held a gbm_device open on the
-	// same fd number. Each gbm_device gets its own fd instead.
-	//
-	// Deliberately lazy (called from output.c on first dmabuf commit, not
-	// from wlr_qnx_screen_backend_create()): creating a gbm_device before
-	// EGL has ever initialized against this device has been observed to
-	// fail outright on this Mesa/virtio-gpu build ("Can't open 'dri'
-	// library!" from Mesa's own DRI loader). By the time we get here, a
-	// dmabuf-backed wlr_buffer already exists, which means the GLES2
-	// renderer (and therefore EGL) already initialized successfully.
-	int gbm_fd = fcntl(backend->drm_fd, F_DUPFD_CLOEXEC, 0);
-	if (gbm_fd < 0) {
-		wlr_log_errno(WLR_ERROR, "Failed to dup DRM fd for our own gbm_device");
-		return NULL;
-	}
-
-	backend->gbm_device = gbm_create_device(gbm_fd);
-	if (backend->gbm_device == NULL) {
-		wlr_log(WLR_ERROR,
-			"gbm_create_device failed on the DRM render node; dmabuf "
-			"output buffers won't be readable");
-		close(gbm_fd);
-		return NULL;
-	}
-
-	backend->gbm_fd = gbm_fd;
-	return backend->gbm_device;
-}
-
 static int backend_get_drm_fd(struct wlr_backend *wlr_backend) {
 	struct wlr_qnx_screen_backend *backend =
 		qnx_screen_backend_from_backend(wlr_backend);
@@ -310,18 +250,12 @@ static int backend_get_drm_fd(struct wlr_backend *wlr_backend) {
 	// fall back to pixman + the generic SHM allocator automatically in that
 	// case.
 	//
-	// Deliberately NOT gated on backend->gbm_device here (that would be
-	// tempting, since output.c's copy_buffer_to_window() needs a working
-	// gbm_device to actually read GPU-rendered buffers back). But this
-	// backend's own gbm_device is created lazily, on first use, in
-	// output.c -- specifically because creating one eagerly here, before
-	// EGL has ever touched the device, has been observed to fail outright
-	// on this Mesa/virtio-gpu build (Mesa's GBM "dri" backend needs EGL to
-	// have already initialized against the device first). Reporting -1
-	// here before that's had a chance to happen would prevent
-	// wlr_allocator_autocreate() from ever trying GBM at all, even though
-	// its own (separate, later) gbm_device -- created only after the GLES2
-	// renderer already exists -- works fine.
+	// With a GLES2 renderer this fd is what lets wlr_allocator_autocreate()
+	// pick a GBM allocator, and that swapchain is required rather than
+	// optional: the gles2 renderer can only draw into a DMA-BUF, so pixman's
+	// SHM buffers are not an option for it. This backend only ever *reads*
+	// those buffers -- via glReadPixels in copy_buffer_to_window_gles() -- and
+	// never creates a gbm_device of its own.
 	return backend->drm_fd;
 }
 
@@ -356,12 +290,7 @@ struct wlr_backend *wlr_qnx_screen_backend_create(struct wl_event_loop *loop) {
 	// backend_get_drm_fd() actually returns a valid fd below; otherwise it
 	// falls back to SHM automatically. Safe to advertise unconditionally.
 	backend->backend.buffer_caps = WLR_BUFFER_CAP_SHM | WLR_BUFFER_CAP_DMABUF;
-	backend->gbm_fd = -1;
 	backend->drm_fd = open_drm_render_node();
-	// backend->gbm_device is NOT created here -- see qnx_screen_get_gbm_device()
-	// in output.c, which creates it lazily on first use instead. Doing it
-	// this early (before EGL has ever touched the device) has been observed
-	// to fail outright on some Mesa/virtio-gpu builds.
 
 	backend->event_loop = loop;
 	wl_list_init(&backend->outputs);
@@ -380,9 +309,10 @@ struct wlr_backend *wlr_qnx_screen_backend_create(struct wl_event_loop *loop) {
 	wlr_drm_format_set_add(&backend->shm_formats, DRM_FORMAT_XRGB8888,
 		DRM_FORMAT_MOD_INVALID);
 
-	// Explicit LINEAR (not INVALID/"driver's choice") so the GBM allocator
-	// can't hand us a tiled/compressed layout we can't safely mmap+memcpy
-	// from in copy_buffer_to_window().
+	// Explicit LINEAR (not INVALID/"driver's choice"). This backend no longer
+	// reads those buffers' memory itself, but advertising one concrete
+	// modifier keeps wlr_allocator_autocreate()/output_pick_format() from
+	// having to choose between several.
 	wlr_drm_format_set_add(&backend->dmabuf_formats, DRM_FORMAT_XRGB8888,
 		DRM_FORMAT_MOD_LINEAR);
 
@@ -417,12 +347,6 @@ error_context:
 	wlr_drm_format_set_finish(&backend->dmabuf_formats);
 	screen_destroy_context(backend->context);
 error_backend:
-	if (backend->gbm_device != NULL) {
-		gbm_device_destroy(backend->gbm_device);
-	}
-	if (backend->gbm_fd >= 0) {
-		close(backend->gbm_fd);
-	}
 	if (backend->drm_fd >= 0) {
 		close(backend->drm_fd);
 	}

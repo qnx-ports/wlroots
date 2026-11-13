@@ -26,11 +26,13 @@ struct wlr_input_device;
  * created by this backend via the QNX Screen Graphics Subsystem
  * (libscreen / screen/screen.h).
  *
- * This backend has no notion of DRM/GBM: wlr_backend_get_drm_fd() always
- * returns -1, and the backend only advertises WLR_BUFFER_CAP_SHM. Pair it
- * with wlr_renderer_autocreate()/wlr_allocator_autocreate(), which will fall
- * back to the pixman (CPU) renderer and the generic shared-memory allocator
- * automatically.
+ * Pair it with wlr_renderer_autocreate()/wlr_allocator_autocreate(). If a DRM
+ * render node is available, wlr_backend_get_drm_fd() returns it and the
+ * backend advertises WLR_BUFFER_CAP_DMABUF, which lets those pick the GLES2
+ * renderer and a GBM allocator; if not, get_drm_fd() returns -1, only
+ * WLR_BUFFER_CAP_SHM is usable, and they fall back to the pixman (CPU)
+ * renderer and the shared-memory allocator. Both configurations are
+ * supported; the present path follows whichever renderer is chosen.
  */
 struct wlr_backend *wlr_qnx_screen_backend_create(struct wl_event_loop *loop);
 
