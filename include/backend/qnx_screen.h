@@ -57,6 +57,8 @@ struct wlr_qnx_screen_backend {
 	struct wl_listener event_loop_destroy;
 };
 
+struct wlr_qnx_screen_vsync_notifier;
+
 struct wlr_qnx_screen_output {
 	struct wlr_output wlr_output;
 	struct wlr_qnx_screen_backend *backend;
@@ -77,6 +79,22 @@ struct wlr_qnx_screen_output {
 
 	int32_t frame_delay_ms;
 	struct wl_event_source *frame_timer;
+
+	/*
+	 * Display-locked frame pacing, when the display supports it. NULL means
+	 * this output paces purely from frame_timer. See vsync_notifier.c.
+	 */
+	struct wlr_qnx_screen_vsync_notifier *vsync;
+	struct wl_event_source *vsync_source;
+
+	/*
+	 * Guards against the vsync notifier going quiet: every commit rearms a
+	 * timer with the full period, and that timer only emits a frame event if
+	 * the vsync tick has not arrived in the meantime. Losing frame events
+	 * stalls an output permanently, so the timer is never disabled while
+	 * vsync pacing is active -- it is a watchdog as well as a fallback.
+	 */
+	bool frame_event_pending;
 
 	/*
 	 * Both present paths copy the finished frame into one of this window's

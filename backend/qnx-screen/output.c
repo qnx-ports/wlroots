@@ -17,8 +17,11 @@
 #include <wlr/util/log.h>
 
 #include "backend/qnx_screen.h"
+#include "backend/qnx_screen_vsync_notifier.h"
 #include "types/wlr_buffer.h"
 #include "types/wlr_output.h"
+
+
 
 static const uint32_t SUPPORTED_OUTPUT_STATE =
 	WLR_OUTPUT_STATE_BACKEND_OPTIONAL |
@@ -280,15 +283,66 @@ static bool output_test(struct wlr_output *wlr_output,
 	return true;
 }
 
-static int finish_frame_handler(void *data) {
-	struct wlr_qnx_screen_output *output = data;
+static void emit_frame_event(struct wlr_qnx_screen_output *output) {
+	if (!output->frame_event_pending) {
+		// Already emitted for this frame, by whichever of the vsync tick and
+		// the pacing timer got here first.
+		return;
+	}
+	output->frame_event_pending = false;
 	/* Record when the frame event goes out: the compositor's render and the
 	 * resulting commit both happen after this, so it is the start of the frame
 	 * period the pacer in output_commit() measures against. */
 	clock_gettime(CLOCK_MONOTONIC, &output->frame_event_at);
 	wlr_output_send_frame(&output->wlr_output);
+}
+
+static int finish_frame_handler(void *data) {
+	struct wlr_qnx_screen_output *output = data;
+	emit_frame_event(output);
+	/*
+	 * The timer won this frame, so a vsync tick may still be sitting in the
+	 * pipe: the notifier consumed its arm to write it, and nothing will read
+	 * it now. Left there, it would make the fd readable at the next commit
+	 * and emit that frame immediately, off vsync. Discard it.
+	 */
+	if (output->vsync != NULL) {
+		wlr_qnx_screen_vsync_notifier_drain(output->vsync);
+	}
 	return 0;
 }
+
+static int vsync_handler(int fd, uint32_t mask, void *data) {
+	struct wlr_qnx_screen_output *output = data;
+	(void)fd; (void)mask;
+
+	wlr_qnx_screen_vsync_notifier_drain(output->vsync);
+
+	if (wlr_qnx_screen_vsync_notifier_failed(output->vsync)) {
+		// Never fires again; leave the pacing timer in sole charge.
+		wlr_log(WLR_INFO, "qnx-screen: vsync pacing unavailable, "
+			"using the timer");
+		return 0;
+	}
+
+	/*
+	 * The frame event is being emitted off the display's own vsync, so cancel
+	 * the timer that was armed for this frame; leaving it armed would emit a
+	 * second event and let the compositor run ahead of the panel.
+	 *
+	 * No re-arm here on purpose. Commit() arms once per frame, which is how a
+	 * page-flip backend behaves (one completion per flip): while the
+	 * compositor has nothing to render no tick is requested, so the event loop
+	 * is not woken at refresh rate for no work.
+	 */
+	if (output->frame_event_pending
+			&& wl_event_source_timer_update(output->frame_timer, 0) != 0) {
+		wlr_log(WLR_ERROR, "qnx-screen: failed to cancel frame timer");
+	}
+	emit_frame_event(output);
+	return 0;
+}
+
 
 // GLES2 present path.
 //
@@ -628,37 +682,37 @@ static bool output_commit(struct wlr_output *wlr_output,
 		output_defer_present(wlr_output, present_event);
 
 		/*
-		 * Fake vsync. wlroots expects an output to emit a frame event once per
-		 * display refresh, and that event is what releases the next frame
-		 * through the compositor; an output that stops emitting it stalls.
-		 * Nothing here can drive it directly: screen_wait_vsync() does work on
-		 * this driver (measured 12-17ms per call, ~60Hz) but it BLOCKS, and
-		 * this runs on the compositor's single-threaded event loop.
+		 * Frame pacing. wlroots expects an output to emit a frame event once
+		 * per display refresh, and that event is what releases the next frame
+		 * through the compositor; an output that stops emitting it stalls. A
+		 * DRM backend gets this for free from the page-flip completion the
+		 * kernel reports. A Screen window has no such completion: post_window
+		 * returns as soon as the buffer is queued (measured 0.04ms), so the
+		 * cadence has to be manufactured from something else, in two layers:
 		 *
-		 * A real present completion is available -- screen_notify() with
-		 * SCREEN_NOTIFY_UPDATE fires when Screen finishes composition, and
-		 * backend/qnx-screen/event_monitor.c already has the thread-plus-pipe
-		 * plumbing that turns a Screen pulse into a non-blocking wayland fd
-		 * event source (it is used for input today). Wiring that up to send
-		 * frame events would replace this timer and make pacing follow the
-		 * display rather than a wall clock estimate; it is left as a timer for
-		 * now because it needs verifying against real hardware, where the
-		 * notification may arrive on a different cadence than measured here.
+		 *  - a thread parked in screen_wait_vsync() (vsync_notifier.c), which
+		 *    is the only display-locked source here and wins whenever it
+		 *    fires -- about 95% of frames measured on virtio/virgl;
+		 *  - this timer, as the fallback whenever vsync is unavailable (it
+		 *    fails with ENOTSUP on a mirrored display) or a tick is missed.
+		 *    Losing frame events stalls an output permanently, so the timer
+		 *    is armed for every frame and is never disabled.
 		 *
-		 * TODO: drive frame events from SCREEN_NOTIFY_UPDATE.
+		 * screen_notify(SCREEN_NOTIFY_UPDATE) would be the true analogue of a
+		 * page-flip event -- it fires when Screen finishes composition -- but
+		 * it cannot be registered on this driver at all: it returns EPERM for
+		 * both a window and a display target, even as root, and ENOENT for a
+		 * context-wide registration. screen_wait_vsync() is what is left, and
+		 * it is accurate: 59.97Hz, +/-0.65ms jitter, zero drift over 5s.
 		 *
-
-		 * It has to be a period TARGET, not a fixed post-commit delay: the
-		 * frame callback is what unblocks the next frame, so any delay here
+		 * The timer has to be a period TARGET, not a fixed post-commit delay:
+		 * the frame callback is what unblocks the next frame, so a flat delay
 		 * is added to the frame time rather than overlapping with it. With a
-		 * flat 16ms the measured frame period was commit + 16ms exactly --
-		 * 33ms (29fps) once the GLES2 read-back had eaten 17ms, and only
-		 * 17ms (55fps) on the pixman path, where commit is under 1ms. Both
-		 * far from the 60Hz the panel actually runs at.
-		 *
-		 * Charging the commit time against the period makes the backend hold
-		 * the frame rate instead of degrading with it: a 17ms commit still
-		 * leaves ~0ms to wait, and an idle commit still paces at 60Hz.
+		 * flat 16ms the measured period was commit + 16ms exactly -- 33ms
+		 * (29fps) once the GLES2 read-back had eaten 17ms, and 17ms (55fps)
+		 * on the pixman path, where commit is under 1ms. Charging elapsed
+		 * time against the period makes the backend hold the frame rate
+		 * instead of degrading with it.
 		 *
 		 * Clamped to at least 1ms on purpose: wl_event_source_timer_update()
 		 * treats 0 as "disable the timer", which would stall the output loop
@@ -687,6 +741,25 @@ static bool output_commit(struct wlr_output *wlr_output,
 			delay = 1;
 		} else if (delay > period) {
 			delay = period;
+		}
+		/*
+		 * Both paces are armed and the first to fire emits the frame event
+		 * (see emit_frame_event()). On a display where screen_wait_vsync()
+		 * works, the tick usually wins and the frame lands on a real vsync;
+		 * the timer is what keeps the output alive when it does not, when the
+		 * display is mirrored (ENOTSUP), or when a tick is ever missed.
+		 */
+		output->frame_event_pending = true;
+		if (output->vsync != NULL
+				&& !wlr_qnx_screen_vsync_notifier_failed(output->vsync)) {
+			/*
+			 * Drop any tick left in the pipe before asking for a new one.
+			 * A byte written just after the fallback timer emitted would
+			 * otherwise leave the fd readable, and the fd handler would
+			 * release this frame immediately instead of on its own vsync.
+			 */
+			wlr_qnx_screen_vsync_notifier_drain(output->vsync);
+			wlr_qnx_screen_vsync_notifier_arm(output->vsync);
 		}
 		wl_event_source_timer_update(output->frame_timer, (int32_t)delay);
 	}
@@ -747,6 +820,14 @@ static void output_destroy(struct wlr_output *wlr_output) {
 	output->readback_cap = 0;
 
 	wl_list_remove(&output->link);
+
+	if (output->vsync_source != NULL) {
+		wl_event_source_remove(output->vsync_source);
+		output->vsync_source = NULL;
+	}
+	// Joins the vsync thread, which can take up to one refresh.
+	wlr_qnx_screen_vsync_notifier_destroy(output->vsync);
+	output->vsync = NULL;
 
 	if (output->frame_timer != NULL) {
 		wl_event_source_remove(output->frame_timer);
@@ -883,6 +964,29 @@ struct wlr_output *wlr_qnx_screen_output_create(struct wlr_backend *wlr_backend)
 
 	output->frame_timer = wl_event_loop_add_timer(backend->event_loop,
 		finish_frame_handler, output);
+
+	/*
+	 * Prefer pacing frame events off the display's real vsync. Only offered
+	 * when the display can report one; screen_wait_vsync() fails with ENOTSUP
+	 * on a mirrored display, and on drivers where the call is unsupported,
+	 * which leaves the timer to do all the work.
+	 */
+	screen_display_t vsync_display = output->display != NULL
+		? output->display : backend->default_display;
+	if (vsync_display != NULL) {
+		output->vsync = wlr_qnx_screen_vsync_notifier_create(vsync_display);
+	}
+	if (output->vsync != NULL) {
+		output->vsync_source = wl_event_loop_add_fd(backend->event_loop,
+			output->vsync->pipe_fds[0], WL_EVENT_READABLE, vsync_handler,
+			output);
+		if (output->vsync_source == NULL) {
+			wlr_log(WLR_ERROR, "qnx-screen: failed to watch the vsync fd, "
+				"using the timer");
+			wlr_qnx_screen_vsync_notifier_destroy(output->vsync);
+			output->vsync = NULL;
+		}
+	}
 
 	wlr_pointer_init(&output->pointer, &qnx_screen_pointer_impl, "qnx-screen-pointer");
 	output->pointer.output_name = strdup(wlr_output->name);

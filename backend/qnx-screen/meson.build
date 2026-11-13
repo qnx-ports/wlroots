@@ -29,6 +29,7 @@ wlr_files += files(
 	'event_monitor.c',
 	'input_device.c',
 	'output.c',
+	'vsync_notifier.c',
 )
 wlr_deps += qnx_screen_libs
 features += { 'qnx-screen-backend': true }
