@@ -17,6 +17,7 @@
 #include <wlr/util/log.h>
 
 #include "backend/qnx_screen.h"
+#include "backend/qnx_screen_gl_present.h"
 #include "backend/qnx_screen_vsync_notifier.h"
 #include "types/wlr_buffer.h"
 #include "types/wlr_output.h"
@@ -89,6 +90,10 @@ bool qnx_screen_output_recreate_buffers(struct wlr_qnx_screen_output *output) {
 		wlr_log(WLR_ERROR, "screen_create_window_buffers failed");
 		return false;
 	}
+
+	/* Any GL imports of the old buffers describe memory that is gone; they are
+	 * re-created on the next present. */
+	qnx_gl_present_invalidate(output);
 
 	memset(output->buffers, 0, sizeof(output->buffers));
 	if (screen_get_window_property_pv(output->window,
@@ -163,11 +168,40 @@ static bool output_configure_window(struct wlr_qnx_screen_output *output,
 	return true;
 }
 
+/* Make the output's window exist and be backed the way the present path needs.
+ * A GL present needs GL buffer usage (only then do GL writes to a window render
+ * buffer reach the panel); the CPU read-back needs the opposite, because a
+ * GL-usage window has no SCREEN_PROPERTY_POINTER to copy into. Screen cannot
+ * change a window's usage once it has buffers, so a mismatch means a new
+ * window. Returns false only if the window could not be created. */
+static bool output_ensure_window_backing(struct wlr_qnx_screen_output *output,
+		bool want_gl) {
+	if (output->window != NULL && output->window_is_gl_backed == want_gl) {
+		return true;
+	}
+	if (output->window != NULL) {
+		qnx_screen_output_destroy_window(output);
+	}
+	return qnx_screen_output_create_window(output);
+}
+
 bool qnx_screen_output_create_window(struct wlr_qnx_screen_output *output) {
 	struct wlr_qnx_screen_backend *b = output->backend;
 
-	if (!output_configure_window(output, SCREEN_USAGE_NATIVE
-			| SCREEN_USAGE_READ | SCREEN_USAGE_WRITE)) {
+	/* A GL write into a window render buffer only reaches the panel if the
+	 * window was created with a GL usage bit; with NATIVE|READ|WRITE the buffer
+	 * has a CPU view and that is what gets composited. Conversely a GL-usage
+	 * window has no SCREEN_PROPERTY_POINTER, so the CPU read-back path cannot
+	 * write it. The usage therefore has to match the present path chosen for
+	 * this output, and it must be set before the window has any buffers (see
+	 * output_configure_window). */
+	bool gl_backed = qnx_screen_output_wants_gl_window(output);
+	int usage = gl_backed
+		? (SCREEN_USAGE_NATIVE | SCREEN_USAGE_OPENGL_ES2)
+		: (SCREEN_USAGE_NATIVE | SCREEN_USAGE_READ | SCREEN_USAGE_WRITE);
+	output->window_is_gl_backed = gl_backed;
+
+	if (!output_configure_window(output, usage)) {
 		if (output->window != NULL) {
 			screen_destroy_window(output->window);
 			output->window = NULL;
@@ -198,6 +232,12 @@ bool qnx_screen_output_create_window(struct wlr_qnx_screen_output *output) {
 		output->session = NULL;
 	}
 
+	wlr_log(WLR_INFO, "qnx-screen present path: %s",
+		gl_backed ? "GPU blit into the window buffer (GL-backed window)"
+		: wlr_renderer_is_gles2(output->wlr_output.renderer)
+			? "CPU read-back of the DMA-BUF (CPU-backed window)"
+			: "CPU copy of the SHM buffer (CPU-backed window)");
+
 	int window_id = 0;
 	screen_get_window_property_iv(output->window, SCREEN_PROPERTY_ID,
 		&window_id);
@@ -208,6 +248,7 @@ bool qnx_screen_output_create_window(struct wlr_qnx_screen_output *output) {
 }
 
 void qnx_screen_output_destroy_window(struct wlr_qnx_screen_output *output) {
+	output->window_is_gl_backed = false;
 	if (output->session != NULL) {
 		screen_destroy_session(output->session);
 		output->session = NULL;
@@ -659,14 +700,46 @@ static bool output_commit(struct wlr_output *wlr_output,
 	 */
 	if ((state->committed & WLR_OUTPUT_STATE_BUFFER) && output->window != NULL) {
 		// Which copy depends only on the renderer: GLES2 rendered the frame on
-		// the GPU into a DMA-BUF and has to be read back, pixman rendered it on
-		// the CPU and can be memcpy'd straight out of the buffer.
-		bool ok;
+		// the GPU into a DMA-BUF, pixman rendered it on the CPU and can be
+		// memcpy'd straight out of its buffer. With GLES2 the frame can stay on
+		// the GPU (see gl_present.c) and only falls back to the read-back when
+		// that path declines a frame.
+		bool ok = false;
+		const pixman_region32_t *frame_damage =
+			(state->committed & WLR_OUTPUT_STATE_DAMAGE) ? &state->damage : NULL;
+
 		if (wlr_renderer_is_gles2(wlr_output->renderer)) {
-			ok = copy_buffer_to_window_gles(output, state->buffer,
-				(state->committed & WLR_OUTPUT_STATE_DAMAGE)
-					? &state->damage : NULL);
+			/* Created lazily because the renderer is not known when the
+			 * output is; only allocated when it will actually be used. */
+			if (output->gl_present == NULL
+					&& qnx_screen_output_wants_gl_window(output)) {
+				output->gl_present = wlr_qnx_gl_present_create(output);
+			}
+
+			if (output->gl_present != NULL
+					&& qnx_screen_output_wants_gl_window(output)) {
+				if (output_ensure_window_backing(output, true)) {
+					ok = wlr_qnx_gl_present(output, state->buffer);
+				}
+				if (!ok) {
+					/* Retire it for good: a failure here is a property of this
+					 * driver or window, not of one frame. Note it does not
+					 * touch the window; the next branch rebuilds it. */
+					wlr_qnx_gl_present_disable_and_rebuild(output);
+				}
+			}
+
+			if (!ok) {
+				if (!output_ensure_window_backing(output, false)) {
+					return false;
+				}
+				ok = copy_buffer_to_window_gles(output, state->buffer,
+					frame_damage);
+			}
 		} else {
+			if (!output_ensure_window_backing(output, false)) {
+				return false;
+			}
 			ok = copy_buffer_to_window_cpu(output, state->buffer);
 		}
 		if (!ok || !output_post_window(output, state)) {
@@ -814,6 +887,8 @@ static void output_destroy(struct wlr_output *wlr_output) {
 	}
 
 	qnx_screen_output_destroy_window(output);
+	wlr_qnx_gl_present_destroy(output->gl_present);
+	output->gl_present = NULL;
 
 	free(output->readback_px);
 	output->readback_px = NULL;

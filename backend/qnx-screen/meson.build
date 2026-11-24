@@ -27,6 +27,7 @@ qnx_screen_libs += screen_dep
 wlr_files += files(
 	'backend.c',
 	'event_monitor.c',
+	'gl_present.c',
 	'input_device.c',
 	'output.c',
 	'vsync_notifier.c',

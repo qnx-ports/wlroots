@@ -58,6 +58,7 @@ struct wlr_qnx_screen_backend {
 };
 
 struct wlr_qnx_screen_vsync_notifier;
+struct wlr_qnx_gl_present;
 
 struct wlr_qnx_screen_output {
 	struct wlr_output wlr_output;
@@ -124,6 +125,19 @@ struct wlr_qnx_screen_output {
 	 * compositor's render time against the period as well as our own commit.
 	 */
 	struct timespec frame_event_at;
+
+	/* GPU-side present (see gl_present.c). This is only the "it failed, never
+	 * try again" latch: whether the present is wanted is derived from the
+	 * renderer at window-creation time (qnx_screen_output_wants_gl_window),
+	 * because the renderer is not known when the output is created and a stored
+	 * default would misconfigure a non-GLES2 output's window usage. */
+	struct wlr_qnx_gl_present *gl_present;
+	bool gl_present_failed;
+	/* Whether the window currently exists was created with GL buffer usage,
+	 * i.e. whether its render buffers are writable by GL (and have no
+	 * SCREEN_PROPERTY_POINTER). The present path and this flag have to agree;
+	 * when they stop agreeing the window is rebuilt. */
+	bool window_is_gl_backed;
 
 	struct wlr_pointer pointer;
 	uint32_t prev_buttons;
